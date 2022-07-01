@@ -53,6 +53,7 @@ public class HandlerPoster extends Handler implements Poster {
         try {
             long started = SystemClock.uptimeMillis();
             while (true) {
+                // 双重校验，取pendingPost，外层校验是为了提高效率，内层校验是为了线程安全
                 PendingPost pendingPost = queue.poll();
                 if (pendingPost == null) {
                     synchronized (this) {
@@ -66,6 +67,7 @@ public class HandlerPoster extends Handler implements Poster {
                 }
                 eventBus.invokeSubscriber(pendingPost);
                 long timeInMethod = SystemClock.uptimeMillis() - started;
+                // 订阅方法执行超过最大执行时间了，中断后续方法的执行
                 if (timeInMethod >= maxMillisInsideHandleMessage) {
                     if (!sendMessage(obtainMessage())) {
                         throw new EventBusException("Could not send handler message");

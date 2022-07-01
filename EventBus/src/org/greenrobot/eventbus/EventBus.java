@@ -16,6 +16,8 @@
 package org.greenrobot.eventbus;
 
 import org.greenrobot.eventbus.android.AndroidDependenciesDetector;
+import org.greenrobot.eventbus.util.EventGenerator;
+
 import java.lang.reflect.InvocationTargetException;
 import java.util.ArrayList;
 import java.util.HashMap;
@@ -47,6 +49,8 @@ public class EventBus {
 
     private static final EventBusBuilder DEFAULT_BUILDER = new EventBusBuilder();
     private static final Map<Class<?>, List<Class<?>>> eventTypesCache = new HashMap<>();
+
+    private final EventGenerator eventGenerator = EventGenerator.getInstance();
 
     private final Map<Class<?>, CopyOnWriteArrayList<Subscription>> subscriptionsByEventType;
     private final Map<Object, List<Class<?>>> typesBySubscriber;
@@ -159,17 +163,20 @@ public class EventBus {
     private void subscribe(Object subscriber, SubscriberMethod subscriberMethod) {
         Class<?> eventType = subscriberMethod.eventType;
         Subscription newSubscription = new Subscription(subscriber, subscriberMethod);
+        // 每种eventType都有一个copyOnWriteArrayList用于存储监听该类型事件的所有subscriber和方法
         CopyOnWriteArrayList<Subscription> subscriptions = subscriptionsByEventType.get(eventType);
         if (subscriptions == null) {
+            // 懒加载，由于整个方法都要在synchronize中执行，所以初始化过程不会出现线程安全问题
             subscriptions = new CopyOnWriteArrayList<>();
             subscriptionsByEventType.put(eventType, subscriptions);
         } else {
+            // 该订阅者的订阅方法已被注册
             if (subscriptions.contains(newSubscription)) {
                 throw new EventBusException("Subscriber " + subscriber.getClass() + " already registered to event "
                         + eventType);
             }
         }
-
+        // 按照priority找到当前订阅方法的位置并添加，同样priority等级下，按照先后顺序
         int size = subscriptions.size();
         for (int i = 0; i <= size; i++) {
             if (i == size || subscriberMethod.priority > subscriptions.get(i).subscriberMethod.priority) {
@@ -177,21 +184,23 @@ public class EventBus {
                 break;
             }
         }
-
+        // 记录一个Subscriber的所有订阅事件，其所有调用位置均在synchronized方法或代码块中，因此无需使用线程安全容器
         List<Class<?>> subscribedEvents = typesBySubscriber.get(subscriber);
         if (subscribedEvents == null) {
             subscribedEvents = new ArrayList<>();
             typesBySubscriber.put(subscriber, subscribedEvents);
         }
         subscribedEvents.add(eventType);
-
+        // 处理粘性事件
         if (subscriberMethod.sticky) {
+            // 考虑当前eventType事件以及其所有子类事件
             if (eventInheritance) {
                 // Existing sticky events of all subclasses of eventType have to be considered.
                 // Note: Iterating over all events may be inefficient with lots of sticky events,
                 // thus data structure should be changed to allow a more efficient lookup
                 // (e.g. an additional map storing sub classes of super classes: Class -> List<Class>).
                 Set<Map.Entry<Class<?>, Object>> entries = stickyEvents.entrySet();
+                // 候选的
                 for (Map.Entry<Class<?>, Object> entry : entries) {
                     Class<?> candidateEventType = entry.getKey();
                     if (eventType.isAssignableFrom(candidateEventType)) {
@@ -199,7 +208,9 @@ public class EventBus {
                         checkPostStickyEventToSubscription(newSubscription, stickyEvent);
                     }
                 }
-            } else {
+            }
+            // 仅考虑当前eventType，不考虑子类
+            else {
                 Object stickyEvent = stickyEvents.get(eventType);
                 checkPostStickyEventToSubscription(newSubscription, stickyEvent);
             }
@@ -260,10 +271,11 @@ public class EventBus {
 
     /** Posts the given event to the event bus. */
     public void post(Object event) {
+        // 获取线程独立的PostingThreadState，可理解为当前处理线程的状态
         PostingThreadState postingState = currentPostingThreadState.get();
         List<Object> eventQueue = postingState.eventQueue;
         eventQueue.add(event);
-
+        // 当前线程并没有在处理消息
         if (!postingState.isPosting) {
             postingState.isMainThread = isMainThread();
             postingState.isPosting = true;
@@ -271,6 +283,7 @@ public class EventBus {
                 throw new EventBusException("Internal error. Abort state was not reset");
             }
             try {
+                // 循环处理当前线程独立的所有event
                 while (!eventQueue.isEmpty()) {
                     postSingleEvent(eventQueue.remove(0), postingState);
                 }
@@ -279,6 +292,10 @@ public class EventBus {
                 postingState.isMainThread = false;
             }
         }
+    }
+
+    public void post(Object... args) {
+        post(eventGenerator.generateEventInstance(args));
     }
 
     /**
@@ -314,6 +331,10 @@ public class EventBus {
         }
         // Should be posted after it is putted, in case the subscriber wants to remove immediately
         post(event);
+    }
+
+    public void postSticky(Object... args) {
+        postSticky(eventGenerator.generateEventInstance(args));
     }
 
     /**
@@ -383,6 +404,10 @@ public class EventBus {
         return false;
     }
 
+    /*
+     *    处理一个独立的事件，当设定eventInheritance为True时，那么订阅了当前事件的父事件的订阅者也会收到通知，否则只
+     * 处理当前事件。
+     */
     private void postSingleEvent(Object event, PostingThreadState postingState) throws Error {
         Class<?> eventClass = event.getClass();
         boolean subscriptionFound = false;
@@ -408,6 +433,7 @@ public class EventBus {
     }
 
     private boolean postSingleEventForEventType(Object event, PostingThreadState postingState, Class<?> eventClass) {
+        // 线程安全容器保证了一个subscriber在取消订阅该消息后不会再收到消息
         CopyOnWriteArrayList<Subscription> subscriptions;
         synchronized (this) {
             subscriptions = subscriptionsByEventType.get(eventClass);
@@ -418,6 +444,7 @@ public class EventBus {
                 postingState.subscription = subscription;
                 boolean aborted;
                 try {
+                    // 根据不同策略处理事件
                     postToSubscription(subscription, event, postingState.isMainThread);
                     aborted = postingState.canceled;
                 } finally {
@@ -433,12 +460,14 @@ public class EventBus {
         }
         return false;
     }
-
+    // 根据不同线程策略处理订阅事件
     private void postToSubscription(Subscription subscription, Object event, boolean isMainThread) {
         switch (subscription.subscriberMethod.threadMode) {
+            // 在发布消息的线程处理该事件
             case POSTING:
                 invokeSubscriber(subscription, event);
                 break;
+            // 若当前线程是主线程（UI），则直接处理该事件；否则在poster中排队执行
             case MAIN:
                 if (isMainThread) {
                     invokeSubscriber(subscription, event);
@@ -446,6 +475,7 @@ public class EventBus {
                     mainThreadPoster.enqueue(subscription, event);
                 }
                 break;
+            // 在主线程poster中排队，会立即返回；除非poster未定义（非Android程序调用，可能出现主线程poster为空的情况）
             case MAIN_ORDERED:
                 if (mainThreadPoster != null) {
                     mainThreadPoster.enqueue(subscription, event);
@@ -454,6 +484,7 @@ public class EventBus {
                     invokeSubscriber(subscription, event);
                 }
                 break;
+            // 后台运行，若当前为主线程，在去后台线程poster排队，否则直接在当前线程执行
             case BACKGROUND:
                 if (isMainThread) {
                     backgroundPoster.enqueue(subscription, event);
@@ -461,6 +492,7 @@ public class EventBus {
                     invokeSubscriber(subscription, event);
                 }
                 break;
+            // 异步执行（使用builder的DEFAULT_EXECUTOR_SERVICE，默认定义为newCachedThreadPool创建线程执行）
             case ASYNC:
                 asyncPoster.enqueue(subscription, event);
                 break;
@@ -514,7 +546,11 @@ public class EventBus {
 
     void invokeSubscriber(Subscription subscription, Object event) {
         try {
-            subscription.subscriberMethod.method.invoke(subscription.subscriber, event);
+            if (EventGenerator.DefaultEvent.class.isAssignableFrom(event.getClass())) {
+                subscription.subscriberMethod.method.invoke(subscription.subscriber, eventGenerator.eventToParameters(event));
+            } else {
+                subscription.subscriberMethod.method.invoke(subscription.subscriber, event);
+            }
         } catch (InvocationTargetException e) {
             handleSubscriberException(subscription, event, e.getCause());
         } catch (IllegalAccessException e) {

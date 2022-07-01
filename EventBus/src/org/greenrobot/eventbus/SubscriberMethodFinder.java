@@ -17,6 +17,8 @@ package org.greenrobot.eventbus;
 
 import org.greenrobot.eventbus.meta.SubscriberInfo;
 import org.greenrobot.eventbus.meta.SubscriberInfoIndex;
+import org.greenrobot.eventbus.util.EventGenerator;
+import org.greenrobot.eventbus.util.TypeUtil;
 
 import java.lang.reflect.Method;
 import java.lang.reflect.Modifier;
@@ -37,6 +39,8 @@ class SubscriberMethodFinder {
 
     private static final int MODIFIERS_IGNORE = Modifier.ABSTRACT | Modifier.STATIC | BRIDGE | SYNTHETIC;
     private static final Map<Class<?>, List<SubscriberMethod>> METHOD_CACHE = new ConcurrentHashMap<>();
+
+    private final EventGenerator eventGenerator = EventGenerator.getInstance();
 
     private List<SubscriberInfoIndex> subscriberInfoIndexes;
     private final boolean strictMethodVerification;
@@ -72,6 +76,10 @@ class SubscriberMethodFinder {
         }
     }
 
+    /**
+     *   流程与基于反射的方法类似，会先找当前findState里面是否存在当前类型的方法，即subscriberInfo（存在方式可以是EventBusBuilder构造
+     * 时传递的，也可以是后期传递给他），若不存在则回退到使用反射方法寻找
+     */
     private List<SubscriberMethod> findUsingInfo(Class<?> subscriberClass) {
         FindState findState = prepareFindState();
         findState.initForSubscriber(subscriberClass);
@@ -138,15 +146,25 @@ class SubscriberMethodFinder {
     }
 
     private List<SubscriberMethod> findUsingReflection(Class<?> subscriberClass) {
+        // 参与同步资源（FindStatePool）的竞争，默认池子容量为4
         FindState findState = prepareFindState();
+        // 获取锁成功
         findState.initForSubscriber(subscriberClass);
+        // 从当前类型开始往上遍历
         while (findState.clazz != null) {
+            // 寻找当前类中的方法，并设置是否继续往上遍历寻找
             findUsingReflectionInSingleClass(findState);
             findState.moveToSuperclass();
         }
+        // 释放同步资源，并返回获取到的方法
         return getMethodsAndRelease(findState);
     }
 
+    /**
+     *    寻找当前类的所有方法，默认使用getDeclaredMethods获取所有类自己声明的方法（不包含继承的方法），若
+     *   getDeclaredMethods成功则需要在下一次进入父类继续寻找；否则回退到使用getMethods（比getDeclaredMethods
+     *   慢），并且不需要继续进入父类寻找。
+     */
     private void findUsingReflectionInSingleClass(FindState findState) {
         Method[] methods;
         try {
@@ -168,23 +186,34 @@ class SubscriberMethodFinder {
             findState.skipSuperClasses = true;
         }
         for (Method method : methods) {
+            // 方法必须有public修饰，并且修饰符不能是abstract、static、BRIDGE、SYNTHETIC其中之一或组合
             int modifiers = method.getModifiers();
             if ((modifiers & Modifier.PUBLIC) != 0 && (modifiers & MODIFIERS_IGNORE) == 0) {
-                Class<?>[] parameterTypes = method.getParameterTypes();
-                if (parameterTypes.length == 1) {
-                    Subscribe subscribeAnnotation = method.getAnnotation(Subscribe.class);
-                    if (subscribeAnnotation != null) {
-                        Class<?> eventType = parameterTypes[0];
+                Subscribe subscribeAnnotation = method.getAnnotation(Subscribe.class);
+                // 检查是否有Subscribe注解
+                if (subscribeAnnotation != null) {
+                    Class<?>[] parameterTypes = method.getParameterTypes();
+                    if (parameterTypes.length == 0) {
+                        if (strictMethodVerification && method.isAnnotationPresent(Subscribe.class)) {
+                            String methodName = method.getDeclaringClass().getName() + "." + method.getName();
+                            throw new EventBusException("@Subscribe method " + methodName +
+                                    "must have at least 1 parameter");
+                        }
+                    } else {
+                        Class<?> eventType;
+                        if (parameterTypes.length == 1){
+                            eventType = TypeUtil.getBoxType(parameterTypes[0]);
+                        } else {
+                            eventType = eventGenerator.generateEvent(parameterTypes);
+                        }
+                        // 检查当前方法能否被加入订阅方法列表
                         if (findState.checkAdd(method, eventType)) {
                             ThreadMode threadMode = subscribeAnnotation.threadMode();
                             findState.subscriberMethods.add(new SubscriberMethod(method, eventType, threadMode,
                                     subscribeAnnotation.priority(), subscribeAnnotation.sticky()));
                         }
                     }
-                } else if (strictMethodVerification && method.isAnnotationPresent(Subscribe.class)) {
-                    String methodName = method.getDeclaringClass().getName() + "." + method.getName();
-                    throw new EventBusException("@Subscribe method " + methodName +
-                            "must have exactly 1 parameter but has " + parameterTypes.length);
+
                 }
             } else if (strictMethodVerification && method.isAnnotationPresent(Subscribe.class)) {
                 String methodName = method.getDeclaringClass().getName() + "." + method.getName();
